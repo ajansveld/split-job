@@ -3,9 +3,17 @@
 ## Run commands in multiple concurrent pipelines
 ##   by Arnoud Jansveld - www.jansveld.net/powershell
 ## Version History
-## 0.92   Add UseProfile switch: imports the PS profile into each runspace
-##        Add Variable parameter: imports variable(s) into each runspace
-##        Add Alias parameter: imports alias(es)
+## 0.93   Improve error handling: errors originating in the Scriptblock now
+##        have more meaningful output
+##        Show additional info in the progress bar (thanks Stephen Mills)
+##        Add SnapIn parameter: imports (registered) PowerShell snapins
+##        Add Function parameter: imports functions
+##        Add SplitJobRunSpace variable; allows scripts to test if they are
+##        running in a runspace
+##        Add seconds remaining to progress bar (experimental)
+## 0.92   Add UseProfile switch: imports the PS profile
+##        Add Variable parameter: imports variables
+##        Add Alias parameter: imports aliases
 ##        Restart pipeline if it stops due to an error
 ##        Set the current path in each runspace to that of the calling process
 ## 0.91   Revert to v 0.8 input syntax for the script block
@@ -17,50 +25,79 @@
 ## 0.6    First version. Inspired by Gaurhoth's New-TaskPool script
 ################################################################################
 
-function Split-Job (
-    $Scriptblock = $(throw 'You must specify a command or script block!'),
-    [int]$MaxPipelines=10,
-    [switch]$UseProfile,
-    [string[]]$Variable,
-    [string[]]$Alias
+function Split-Job {
+    param (
+        $Scriptblock = $(throw 'You must specify a command or script block!'),
+        [int]$MaxPipelines=10,
+        [switch]$UseProfile,
+        [string[]]$Variable,
+        [string[]]$Function = @(),
+        [string[]]$Alias = @(),
+        [string[]]$SnapIn
+    )
 
-) {
-    # Create the shared thread-safe queue and fill it with the input objects
-    $Queue = [Collections.Queue]::Synchronized([Collections.Queue]@($Input))
-    $QueueLength = $Queue.Count
-    if ($MaxPipelines -gt $QueueLength) {$MaxPipelines = $QueueLength}
-    # Set up the script to be run by each runspace
-    $Script  = "Set-Location '$PWD'; "
-    $Script += '$Queue = $($Input); '
-    $Script += '& {trap {continue}; while ($Queue.Count) {$Queue.Dequeue()}} |'
-    $Script += $Scriptblock
+    function Init ($InputQueue){
+        # Create the shared thread-safe queue and fill it with the input objects
+        $Queue = [Collections.Queue]::Synchronized([Collections.Queue]@($InputQueue))
+        $QueueLength = $Queue.Count
+        # Do not create more runspaces than input objects
+        if ($MaxPipelines -gt $QueueLength) {$MaxPipelines = $QueueLength}
+        # Create the script to be run by each runspace
+        $Script  = "Set-Location '$PWD'; "
+        $Script += {
+            $SplitJobQueue = $($Input)
+            & {
+                trap {continue}
+                while ($SplitJobQueue.Count) {$SplitJobQueue.Dequeue()}
+            } |
+        }.ToString() + $Scriptblock
 
-    # Create an array to keep track of the set of pipelines
-    $Pipelines = New-Object System.Collections.ArrayList
+        # Create an array to keep track of the set of pipelines
+        $Pipelines = New-Object System.Collections.ArrayList
+
+        # Collect the functions and aliases to import
+        $ImportItems = ($Function -replace '^','Function:') +
+            ($Alias -replace '^','Alias:') |
+            Get-Item | select PSPath, Definition
+        $stopwatch = New-Object System.Diagnostics.Stopwatch
+        $stopwatch.Start()
+    }
 
     function Add-Pipeline {
         # This creates a new runspace and starts an asynchronous pipeline with our script.
         # It will automatically start processing objects from the shared queue.
         $Runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($Host)
         $Runspace.Open()
-        # Optionally import profile, variables and aliases from the main runspace
-        if ($UseProfile) {
-            $Pipeline = $Runspace.CreatePipeline(". '$PROFILE'")
-            $Pipeline.Invoke()
+        $Runspace.SessionStateProxy.SetVariable('SplitJobRunSpace', $True)
+
+        function CreatePipeline {
+            param ($Data, $Scriptblock)
+            $Pipeline = $Runspace.CreatePipeline($Scriptblock)
+            if ($Data) {
+                $Null = $Pipeline.Input.Write($Data, $True)
+                $Pipeline.Input.Close()
+            }
+            $Null = $Pipeline.Invoke()
             $Pipeline.Dispose()
+        }
+
+        # Optionally import profile, variables, functions and aliases from the main runspace
+        if ($UseProfile) {
+            CreatePipeline -Script "`$PROFILE = '$PROFILE'; . `$PROFILE"
         }
         if ($Variable) {
-            Get-Variable $Variable -Scope 2 | foreach {
+            foreach ($var in (Get-Variable $Variable -Scope 2)) {
                 trap {continue}
-                $Runspace.SessionStateProxy.SetVariable($_.Name, $_.Value)
+                $Runspace.SessionStateProxy.SetVariable($var.Name, $var.Value)
             }
         }
-        if ($Alias) {
-            $Pipeline = $Runspace.CreatePipeline({$Input | Set-Alias -value {$_.Definition}})
-            $Null = $Pipeline.Input.Write((Get-Alias $Alias -Scope 2), $True)
-            $Pipeline.Input.Close()
-            $Pipeline.Invoke()
-            $Pipeline.Dispose()
+        if ($ImportItems) {
+            CreatePipeline $ImportItems {
+                foreach ($item in $Input) {New-Item -Path $item.PSPath -Value $item.Definition}
+            }
+        }
+        if ($SnapIn) {
+            CreatePipeline (Get-PSSnapin $Snapin -Registered) {$Input | Add-PSSnapin}
         }
         $Pipeline = $Runspace.CreatePipeline($Script)
         $Null = $Pipeline.Input.Write($Queue)
@@ -76,21 +113,38 @@ function Split-Job (
         $Pipelines.Remove($Pipeline)
     }
 
+    # Main
+    # Initialize the queue from the pipeline
+    . Init $Input
     # Start the pipelines
     while ($Pipelines.Count -lt $MaxPipelines -and $Queue.Count) {Add-Pipeline}
 
-    # Loop through the pipelines and pass their output to the pipeline until they are finished
+    # Loop through the runspaces and pass their output to the main pipeline
     while ($Pipelines.Count) {
-        Write-Progress 'Split-Job' "Queues: $($Pipelines.Count)" `
-            -PercentComplete (100 - [Int]($Queue.Count)/$QueueLength*100)
-        foreach ($Pipeline in (New-Object System.Collections.ArrayList(,$Pipelines))) {
+        # Only update the progress bar once a second
+        if (($stopwatch.ElapsedMilliseconds - $LastUpdate) -gt 1000) {
+            $Completed = $QueueLength - $Queue.Count - $Pipelines.count
+            $LastUpdate = $stopwatch.ElapsedMilliseconds
+            $SecondsRemaining = $(if ($Completed) {
+                (($Queue.Count + $Pipelines.Count)*$LastUpdate/1000/$Completed)
+            } else {-1})
+            Write-Progress 'Split-Job' ("Queues: $($Pipelines.Count)  Total: $($QueueLength)  " +
+            "Completed: $Completed  Pending: $($Queue.Count)")  `
+            -PercentComplete ([Math]::Max((100-[Int]($Queue.Count+$Pipelines.Count)/$QueueLength*100),0)) `
+            -CurrentOperation "Next item: $(trap {continue}; if ($Queue.Count) {$Queue.Peek()})" `
+            -SecondsRemaining $SecondsRemaining
+        }
+        foreach ($Pipeline in @($Pipelines)) {
             if ( -not $Pipeline.Output.EndOfPipeline -or -not $Pipeline.Error.EndOfPipeline ) {
                 $Pipeline.Output.NonBlockingRead()
-                $Pipeline.Error.NonBlockingRead() | Write-Error
+                $Pipeline.Error.NonBlockingRead() | Out-Default
             } else {
+                # Pipeline has stopped; if there was an error show info and restart it
                 if ($Pipeline.PipelineStateInfo.State -eq 'Failed') {
-                    Write-Error $Pipeline.PipelineStateInfo.Reason
-                    # Start a new runspace, unless there was a syntax error in the scriptblock
+                    $Pipeline.PipelineStateInfo.Reason.ErrorRecord |
+                        Add-Member NoteProperty writeErrorStream $True -PassThru |
+                            Out-Default
+                    # Restart the runspace
                     if ($Queue.Count -lt $QueueLength) {Add-Pipeline}
                 }
                 Remove-Pipeline $Pipeline
