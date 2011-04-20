@@ -2,7 +2,29 @@
 ################################################################################
 ## Run commands in multiple concurrent pipelines
 ##   by Arnoud Jansveld - www.jansveld.net/powershell
+##
+## Basic "drop in" usage examples:
+##   - Functions that accept pipelined input:
+##       Without Split-Job:
+##          Get-Content hosts.txt | MyFunction | Export-Csv results.csv
+##       With Split-Job:
+##          Get-Content hosts.txt | Split-Job {MyFunction} | Export-Csv results.csv
+##   - Functions that do not accept pipelined input (use foreach):
+##       Without Split-Job:
+##          Get-Content hosts.txt |% { .\MyScript.ps1 -ComputerName $_ } | Export-Csv results.csv
+##       With Split-Job:
+##          Get-Content hosts.txt | Split-Job {%{ .\MyScript.ps1 -ComputerName $_ }} | Export-Csv results.csv
+##
+## Example with an imported function:
+##       function Test-WebServer ($ComputerName) {
+##           $WebRequest = [System.Net.WebRequest]::Create("http://$ComputerName")
+##           $WebRequest.GetResponse()
+##       }
+##       Get-Content hosts.txt | Split-Job {%{Test-WebServer $_ }} -Function Test-WebServer | Export-Csv results.csv
+##
 ## Version History
+## 1.0    First version posted on poshcode.org
+##        Additional runspace error checking and cleanup
 ## 0.93   Improve error handling: errors originating in the Scriptblock now
 ##        have more meaningful output
 ##        Show additional info in the progress bar (thanks Stephen Mills)
@@ -10,7 +32,6 @@
 ##        Add Function parameter: imports functions
 ##        Add SplitJobRunSpace variable; allows scripts to test if they are
 ##        running in a runspace
-##        Add seconds remaining to progress bar (experimental)
 ## 0.92   Add UseProfile switch: imports the PS profile
 ##        Add Variable parameter: imports variables
 ##        Add Alias parameter: imports aliases
@@ -68,6 +89,7 @@ function Split-Job {
         # It will automatically start processing objects from the shared queue.
         $Runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($Host)
         $Runspace.Open()
+        if (!$?) {throw "Could not open runspace!"}
         $Runspace.SessionStateProxy.SetVariable('SplitJobRunSpace', $True)
 
         function CreatePipeline {
@@ -108,8 +130,10 @@ function Split-Job {
 
     function Remove-Pipeline ($Pipeline) {
         # Remove a pipeline and runspace when it is done
-        $Pipeline.RunSpace.Close()
+        $Runspace = $Pipeline.RunSpace
         $Pipeline.Dispose()
+        $Runspace.Close()
+        $Runspace.Dispose()
         $Pipelines.Remove($Pipeline)
     }
 
@@ -121,7 +145,7 @@ function Split-Job {
 
     # Loop through the runspaces and pass their output to the main pipeline
     while ($Pipelines.Count) {
-        # Only update the progress bar once a second
+        # Show progress
         if (($stopwatch.ElapsedMilliseconds - $LastUpdate) -gt 1000) {
             $Completed = $QueueLength - $Queue.Count - $Pipelines.count
             $LastUpdate = $stopwatch.ElapsedMilliseconds
@@ -130,7 +154,7 @@ function Split-Job {
             } else {-1})
             Write-Progress 'Split-Job' ("Queues: $($Pipelines.Count)  Total: $($QueueLength)  " +
             "Completed: $Completed  Pending: $($Queue.Count)")  `
-            -PercentComplete ([Math]::Max((100-[Int]($Queue.Count+$Pipelines.Count)/$QueueLength*100),0)) `
+            -PercentComplete ([Math]::Max((100 - [Int]($Queue.Count + $Pipelines.Count)/$QueueLength*100),0)) `
             -CurrentOperation "Next item: $(trap {continue}; if ($Queue.Count) {$Queue.Peek()})" `
             -SecondsRemaining $SecondsRemaining
         }
