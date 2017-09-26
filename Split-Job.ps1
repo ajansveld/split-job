@@ -28,6 +28,7 @@
 ##
 ##
 ## Version History
+## 1.3    Fix for PowerShell v5
 ## 1.2    Changes by Stephen Mills - stephenmills at hotmail dot com
 ##        Only works with PowerShell V2
 ##        Modified error output to use ErrorRecord parameter of Write-Error - catches Category Info then.
@@ -99,13 +100,13 @@ function Split-Job
             if ($MaxPipelines -gt $QueueLength) {$MaxPipelines = $QueueLength}
             # Create the script to be run by each runspace
             $Script  = "Set-Location '$PWD'; "
-            $Script += {
+            $Script += '
                 $SplitJobQueue = $($Input)
                 & {
                     trap {continue}
                     while ($SplitJobQueue.Count) {$SplitJobQueue.Dequeue()}
                 } |
-            }.ToString() + $Scriptblock
+            '.ToString() + $Scriptblock
 
             # Create an array to keep track of the set of pipelines
             $Pipelines = New-Object System.Collections.ArrayList
@@ -229,7 +230,7 @@ function Split-Job
                     if ( -not $Pipeline.Output.EndOfPipeline -or -not $Pipeline.Error.EndOfPipeline)
                     {
                         $Pipeline.Output.NonBlockingRead()
-                        $Pipeline.Error.NonBlockingRead() | % { Write-Error -ErrorRecord $_ }
+                        $Pipeline.Error.NonBlockingRead() | foreach { Write-Error -ErrorRecord $_ }
 
                     } else
                     {
@@ -260,7 +261,7 @@ function Split-Job
                         $ExitForced = $true;
                         #foreach ($Pipeline in @($Pipelines))
                         #{
-                        #	$Pipeline.StopAsync()
+                        #   $Pipeline.StopAsync()
                         #}
                     }
                 }
